@@ -28,6 +28,26 @@ _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _RETRY_BASE_DELAY = 0.35
 
 
+def _safe_preview(value: Any, limit: int = 1200) -> str:
+    text = ""
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
+
+
+def _mask_api_key(api_key: Any) -> str:
+    token = str(api_key or "")
+    if not token:
+        return ""
+    if len(token) <= 10:
+        return f"{token[:2]}***"
+    return f"{token[:6]}***{token[-4:]}"
+
+
 def _decode_json(candidate: str) -> Optional[Any]:
     try:
         return json.loads(candidate)
@@ -104,6 +124,7 @@ class OpenRouterLLMNode:
                 "custom_parameters": ("STRING", {"multiline": True, "default": "{}"}),
                 "timeout": ("INT", {"default": 60, "min": 10, "max": 300}),
                 "max_retries": ("INT", {"default": 3, "min": 1, "max": 10}),
+                "debug": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -388,6 +409,44 @@ class OpenRouterLLMNode:
             return level
         return "low"
 
+    def _debug_log(self, enabled: bool, message: str, payload: Any = None) -> None:
+        if not enabled:
+            return
+        if payload is None:
+            line = f"[OpenRouterLLMNode][DEBUG] {message}"
+        else:
+            line = f"[OpenRouterLLMNode][DEBUG] {message}: {_safe_preview(payload)}"
+        print(line)
+        LOGGER.warning(line)
+
+    def _prepare_payload_for_debug(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            sanitized = json.loads(json.dumps(payload))
+        except Exception:
+            return {"unserializable_payload": self._stringify_value(payload)}
+
+        messages = sanitized.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") != "image_url":
+                        continue
+                    image_obj = part.get("image_url")
+                    if not isinstance(image_obj, dict):
+                        continue
+                    url = image_obj.get("url")
+                    if isinstance(url, str) and url.startswith("data:image/"):
+                        prefix = url[:32]
+                        image_obj["url"] = f"{prefix}... [len={len(url)}]"
+        return sanitized
+
     def prepare_messages(
         self,
         system_prompt: Any,
@@ -598,7 +657,7 @@ class OpenRouterLLMNode:
         return payload, applied, ignored
 
     def make_api_request(
-        self, api_key: str, payload: Dict[str, Any], timeout: int, max_retries: int
+        self, api_key: str, payload: Dict[str, Any], timeout: int, max_retries: int, debug: bool = False
     ) -> Tuple[str, Dict[str, Any]]:
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -607,6 +666,17 @@ class OpenRouterLLMNode:
             "HTTP-Referer": "https://comfyui-custom-node",
             "X-Title": "ComfyUI OpenRouter Node",
         }
+        self._debug_log(
+            debug,
+            "request_init",
+            {
+                "url": url,
+                "timeout": timeout,
+                "max_retries": max_retries,
+                "api_key_masked": _mask_api_key(api_key),
+                "payload": self._prepare_payload_for_debug(payload),
+            },
+        )
 
         try:
             request_payload = json.loads(json.dumps(payload))
@@ -625,6 +695,7 @@ class OpenRouterLLMNode:
 
         for attempt in range(1, attempts + 1):
             LOGGER.debug("OpenRouter request attempt=%s model=%s", attempt, payload.get("model", ""))
+            self._debug_log(debug, "request_attempt_start", {"attempt": attempt, "attempts": attempts})
             try:
                 response = session.post(
                     url,
@@ -634,26 +705,40 @@ class OpenRouterLLMNode:
                 )
             except requests.exceptions.Timeout:
                 last_error = f"Timeout na tentativa {attempt}/{attempts}"
+                self._debug_log(debug, "request_timeout", {"attempt": attempt, "error": last_error})
                 if attempt < attempts:
                     time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
                     continue
                 break
             except requests.exceptions.RequestException as exc:
                 last_error = f"Erro de conexão: {str(exc)}"
+                self._debug_log(debug, "request_connection_error", {"attempt": attempt, "error": last_error})
                 if attempt < attempts:
                     time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
                     continue
                 break
             except Exception as exc:
                 last_error = f"Erro inesperado: {str(exc)}"
+                self._debug_log(debug, "request_unexpected_error", {"attempt": attempt, "error": last_error})
                 break
 
             try:
+                self._debug_log(
+                    debug,
+                    "response_received",
+                    {
+                        "attempt": attempt,
+                        "status_code": response.status_code,
+                        "request_id": response.headers.get("x-request-id") or response.headers.get("X-Request-Id"),
+                        "body_preview": _safe_preview(response.text, 2000),
+                    },
+                )
                 if response.status_code == 200:
                     try:
                         response_data = response.json()
                     except ValueError:
                         last_error = "Resposta JSON inválida do provedor"
+                        self._debug_log(debug, "response_json_error", {"attempt": attempt, "error": last_error})
                         if attempt < attempts:
                             time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
                             continue
@@ -689,6 +774,15 @@ class OpenRouterLLMNode:
                         if reasoning:
                             status_info["reasoning"] = reasoning
 
+                        self._debug_log(
+                            debug,
+                            "response_success_parsed",
+                            {
+                                "attempt": attempt,
+                                "status_info": status_info,
+                                "message_preview": _safe_preview(message, 1500),
+                            },
+                        )
                         if message_content:
                             return message_content, status_info
 
@@ -696,6 +790,7 @@ class OpenRouterLLMNode:
                         return self._stringify_value(message), status_info
 
                     last_error = "Resposta inválida do provedor: campo 'choices' ausente ou vazio"
+                    self._debug_log(debug, "response_choices_empty", {"attempt": attempt, "error": last_error})
                     if attempt < attempts:
                         time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
                         continue
@@ -703,6 +798,7 @@ class OpenRouterLLMNode:
 
                 detail = self._extract_error_detail(response)
                 last_error = f"HTTP {response.status_code}: {detail}"
+                self._debug_log(debug, "response_http_error", {"attempt": attempt, "error": last_error})
                 if _should_retry(response.status_code) and attempt < attempts:
                     time.sleep(self._resolve_retry_delay(response, attempt))
                     continue
@@ -730,6 +826,7 @@ class OpenRouterLLMNode:
         custom_parameters: Any = "{}",
         timeout: int = 60,
         max_retries: int = 3,
+        debug: bool = True,
         **kwargs: Any,
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
         provider_name = "openrouter"
@@ -756,6 +853,25 @@ class OpenRouterLLMNode:
                 timeout = kwargs.get("timeout")
             if kwargs.get("max_retries") is not None:
                 max_retries = kwargs.get("max_retries")
+            if kwargs.get("debug") is not None:
+                debug = bool(kwargs.get("debug"))
+
+            self._debug_log(
+                debug,
+                "execute_start",
+                {
+                    "api_key_masked": _mask_api_key(api_key),
+                    "model": model,
+                    "reasoning_level": reasoning_level,
+                    "max_tokens": max_tokens,
+                    "timeout": timeout,
+                    "max_retries": max_retries,
+                    "user_prompt_preview": _safe_preview(user_prompt, 500),
+                    "user_image_type": type(user_image).__name__ if user_image is not None else None,
+                    "user_image_shape": str(getattr(user_image, "shape", None)),
+                    "extra_kwargs_keys": sorted(list(kwargs.keys())),
+                },
+            )
 
             if not str(api_key or "").strip():
                 status = {
@@ -763,6 +879,7 @@ class OpenRouterLLMNode:
                     "error": "API key não fornecida",
                     "provider": provider_name,
                 }
+                self._debug_log(debug, "execute_missing_api_key", status)
                 return self._finalize_outputs("", "", [], status)
 
             custom_params_raw: Any = {}
@@ -776,6 +893,7 @@ class OpenRouterLLMNode:
                             "error": f"Parâmetros customizados inválidos: {decode_error}",
                             "provider": provider_name,
                         }
+                        self._debug_log(debug, "execute_invalid_custom_parameters", status)
                         return self._finalize_outputs("", "", [], status)
             elif isinstance(custom_parameters, dict):
                 custom_params_raw = custom_parameters
@@ -786,6 +904,7 @@ class OpenRouterLLMNode:
                     "error": "Parâmetros customizados devem ser um objeto JSON",
                     "provider": provider_name,
                 }
+                self._debug_log(debug, "execute_custom_parameters_not_object", status)
                 return self._finalize_outputs("", "", [], status)
 
             normalized_reasoning_level = self._normalize_reasoning_level(reasoning_level)
@@ -802,13 +921,24 @@ class OpenRouterLLMNode:
                     "error": str(missing_prompt),
                     "provider": provider_name,
                 }
+                self._debug_log(debug, "execute_prepare_messages_error", status)
                 return self._finalize_outputs("", "", [], status)
 
             payload, applied_params, ignored_params = self.build_request_payload(
                 model, messages, normalized_reasoning_level, max_tokens, custom_params
             )
+            self._debug_log(
+                debug,
+                "payload_built",
+                {
+                    "applied_params": applied_params,
+                    "ignored_params": ignored_params,
+                    "message_count": len(messages),
+                    "payload": self._prepare_payload_for_debug(payload),
+                },
+            )
 
-            response_content, status_data = self.make_api_request(api_key, payload, timeout, max_retries)
+            response_content, status_data = self.make_api_request(api_key, payload, timeout, max_retries, debug=debug)
 
             status_data = status_data or {}
             status_data.setdefault("provider", provider_name)
@@ -843,6 +973,14 @@ class OpenRouterLLMNode:
                 fallback_error = ""
                 if isinstance(status_data, dict):
                     fallback_error = self._stringify_value(status_data.get("error", ""))
+                self._debug_log(
+                    debug,
+                    "execute_empty_response_content",
+                    {
+                        "fallback_error": fallback_error,
+                        "status_data": status_data,
+                    },
+                )
                 return self._finalize_outputs(fallback_error, "", [], status_data)
 
             parsed_json = self.parse_json_from_response(response_content)
@@ -858,6 +996,14 @@ class OpenRouterLLMNode:
             else:
                 extracted_values = [self._stringify_value(response_content)]
 
+            self._debug_log(
+                debug,
+                "execute_success_finalize",
+                {
+                    "response_preview": _safe_preview(response_content, 1000),
+                    "status_data": status_data,
+                },
+            )
             return self._finalize_outputs(response_content, json_response, extracted_values, status_data)
 
         except Exception as exc:
@@ -866,6 +1012,7 @@ class OpenRouterLLMNode:
                 "error": f"Erro interno: {str(exc)}",
                 "provider": provider_name,
             }
+            self._debug_log(debug, "execute_exception", status)
             LOGGER.exception("Erro interno em execute_api_call")
             return self._finalize_outputs("", "", [], status)
 
