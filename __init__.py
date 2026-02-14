@@ -720,9 +720,9 @@ class OpenRouterLLMNode:
 
     def execute_api_call(
         self,
-        api_key: str,
-        system_prompt: str,
-        user_prompt: Any,
+        api_key: Any = "",
+        system_prompt: Any = "",
+        user_prompt: Any = "",
         reasoning_level: str = "low",
         max_tokens: int = 0,
         model: str = "x-ai/grok-4.1-fast",
@@ -730,10 +730,33 @@ class OpenRouterLLMNode:
         custom_parameters: Any = "{}",
         timeout: int = 60,
         max_retries: int = 3,
+        **kwargs: Any,
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
         provider_name = "openrouter"
 
         try:
+            # Compatibility shim for older/newer ComfyUI invocation styles.
+            if api_key in (None, "") and isinstance(kwargs.get("api_key"), str):
+                api_key = kwargs.get("api_key")
+            if system_prompt in (None, "") and kwargs.get("system_prompt") is not None:
+                system_prompt = kwargs.get("system_prompt")
+            if user_prompt in (None, "") and kwargs.get("user_prompt") is not None:
+                user_prompt = kwargs.get("user_prompt")
+            if user_image is None and "user_image" in kwargs:
+                user_image = kwargs.get("user_image")
+            if kwargs.get("reasoning_level") is not None:
+                reasoning_level = kwargs.get("reasoning_level")
+            if kwargs.get("max_tokens") is not None:
+                max_tokens = kwargs.get("max_tokens")
+            if kwargs.get("model") is not None:
+                model = kwargs.get("model")
+            if kwargs.get("custom_parameters") is not None:
+                custom_parameters = kwargs.get("custom_parameters")
+            if kwargs.get("timeout") is not None:
+                timeout = kwargs.get("timeout")
+            if kwargs.get("max_retries") is not None:
+                max_retries = kwargs.get("max_retries")
+
             if not str(api_key or "").strip():
                 status = {
                     "status": "error",
@@ -843,6 +866,7 @@ class OpenRouterLLMNode:
                 "error": f"Erro interno: {str(exc)}",
                 "provider": provider_name,
             }
+            LOGGER.exception("Erro interno em execute_api_call")
             return self._finalize_outputs("", "", [], status)
 
 
