@@ -34,10 +34,10 @@ The node builds request messages in this order:
 
 1. `system` message
 2. `user` message(s) from `user_prompt`
-3. `user` image message(s) generated from `user_image` tensor(s)
+3. image parts from `user_image` are appended to the same final `user` message content array (after text)
 4. extra messages from `custom_parameters.messages` (if provided)
 
-This keeps the prompt text before image context for multimodal models.
+This keeps prompt text before image context and matches OpenRouter multimodal guidance.
 
 ## Reasoning
 

@@ -421,20 +421,45 @@ class OpenRouterLLMNode:
                     messages.append({"role": "user", "content": text})
 
         image_urls = self._parse_image_inputs(user_image)
-        for image_url in image_urls:
-            messages.append(
+        if image_urls:
+            # OpenRouter recommends text first, then images in the same user content array.
+            text_user_index = None
+            for index in range(len(messages) - 1, -1, -1):
+                if messages[index].get("role") == "user":
+                    text_user_index = index
+                    break
+
+            image_parts = [
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_url,
-                            },
-                        }
-                    ],
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url,
+                    },
                 }
-            )
+                for image_url in image_urls
+            ]
+
+            if text_user_index is None:
+                messages.append({"role": "user", "content": image_parts})
+            else:
+                current_content = messages[text_user_index].get("content")
+                merged_parts: List[Dict[str, Any]] = []
+
+                if isinstance(current_content, list):
+                    for item in current_content:
+                        if isinstance(item, dict):
+                            merged_parts.append(item)
+                        elif item is not None:
+                            merged_parts.append({"type": "text", "text": self._stringify_value(item)})
+                elif isinstance(current_content, dict):
+                    merged_parts.append(current_content)
+                elif current_content is not None:
+                    text_value = self._stringify_value(current_content)
+                    if text_value:
+                        merged_parts.append({"type": "text", "text": text_value})
+
+                merged_parts.extend(image_parts)
+                messages[text_user_index]["content"] = merged_parts
 
         if extra_messages is not None:
             extra_sequence = self._coerce_prompt_sequence(extra_messages)
@@ -664,7 +689,11 @@ class OpenRouterLLMNode:
                         if reasoning:
                             status_info["reasoning"] = reasoning
 
-                        return message_content, status_info
+                        if message_content:
+                            return message_content, status_info
+
+                        # Avoid silent empty outputs when provider returns non-text payload.
+                        return self._stringify_value(message), status_info
 
                     last_error = "Resposta inválida do provedor: campo 'choices' ausente ou vazio"
                     if attempt < attempts:
@@ -774,6 +803,13 @@ class OpenRouterLLMNode:
                     for item in message.get("content", [])
                 )
             )
+            status_data["image_part_count"] = sum(
+                1
+                for message in messages
+                if message.get("role") == "user" and isinstance(message.get("content"), list)
+                for item in message.get("content", [])
+                if isinstance(item, dict) and item.get("type") == "image_url"
+            )
 
             if applied_params:
                 status_data["applied_params"] = applied_params
@@ -781,7 +817,10 @@ class OpenRouterLLMNode:
                 status_data["ignored_params"] = ignored_params
 
             if not response_content:
-                return self._finalize_outputs("", "", [], status_data)
+                fallback_error = ""
+                if isinstance(status_data, dict):
+                    fallback_error = self._stringify_value(status_data.get("error", ""))
+                return self._finalize_outputs(fallback_error, "", [], status_data)
 
             parsed_json = self.parse_json_from_response(response_content)
             json_response = ""
