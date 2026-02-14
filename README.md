@@ -7,6 +7,11 @@ ComfyUI custom node for OpenRouter chat completions with:
 - Reasoning effort selection (`low`, `medium`, `high`)
 - Robust JSON extraction from responses
 
+Node key:
+
+- `ArrakisOpenRouterNode`
+- Display name: `Arrakis OpenRouter (Vision + Reasoning)`
+
 ## Inputs
 
 Required:
@@ -67,3 +72,7 @@ You can override via `reasoning_level` or fully override using `custom_parameter
 - No dedicated inputs for `temperature`, `top_p`, `top_k`, etc. If needed, pass them via `custom_parameters`.
 - For strict structure, prefer `response_format` with JSON schema in `custom_parameters`.
 - Non-supported parameters may be ignored by model/provider routing.
+- This repository contains a **ComfyUI Python custom node**. It is not a standalone Node.js app.
+  Running `python __init__.py` now prints a local smoke-test status to help diagnostics.
+- The node is configured as an **output node** and always re-executes on queue runs (`IS_CHANGED -> NaN`),
+  which avoids silent cache skips for API calls.

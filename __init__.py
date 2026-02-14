@@ -89,7 +89,7 @@ def _should_retry(status_code: int) -> bool:
     return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
 
 
-class OpenRouterLLMNode:
+class ArrakisOpenRouterNode:
     """
     ComfyUI custom node for OpenRouter chat completions with robust JSON parsing,
     multimodal image support, and configurable reasoning effort.
@@ -141,8 +141,15 @@ class OpenRouterLLMNode:
         "value_7",
         "status",
     )
-    FUNCTION = "execute_api_call"
+    FUNCTION = "execute_arrakis_openrouter_call"
     CATEGORY = "LLM/API"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # API responses are non-deterministic and can change even with identical inputs.
+        # Returning NaN tells ComfyUI this node should always execute.
+        return float("nan")
 
     def parse_json_from_response(self, text: str) -> Optional[Any]:
         if not text:
@@ -413,9 +420,9 @@ class OpenRouterLLMNode:
         if not enabled:
             return
         if payload is None:
-            line = f"[OpenRouterLLMNode][DEBUG] {message}"
+            line = f"[ArrakisOpenRouterNode][DEBUG] {message}"
         else:
-            line = f"[OpenRouterLLMNode][DEBUG] {message}: {_safe_preview(payload)}"
+            line = f"[ArrakisOpenRouterNode][DEBUG] {message}: {_safe_preview(payload)}"
         print(line)
         LOGGER.warning(line)
 
@@ -664,7 +671,7 @@ class OpenRouterLLMNode:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://comfyui-custom-node",
-            "X-Title": "ComfyUI OpenRouter Node",
+            "X-Title": "ComfyUI Arrakis OpenRouter Node",
         }
         self._debug_log(
             debug,
@@ -814,7 +821,7 @@ class OpenRouterLLMNode:
             "attempts": attempts,
         }
 
-    def execute_api_call(
+    def execute_arrakis_openrouter_call(
         self,
         api_key: Any = "",
         system_prompt: Any = "",
@@ -1013,14 +1020,39 @@ class OpenRouterLLMNode:
                 "provider": provider_name,
             }
             self._debug_log(debug, "execute_exception", status)
-            LOGGER.exception("Erro interno em execute_api_call")
+            LOGGER.exception("Erro interno em execute_arrakis_openrouter_call")
             return self._finalize_outputs("", "", [], status)
+
+    # Backward-compat shim for direct Python calls.
+    def execute_api_call(self, *args: Any, **kwargs: Any) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
+        return self.execute_arrakis_openrouter_call(*args, **kwargs)
 
 
 NODE_CLASS_MAPPINGS = {
-    "OpenRouterLLMNode": OpenRouterLLMNode,
+    "ArrakisOpenRouterNode": ArrakisOpenRouterNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "OpenRouterLLMNode": "OpenRouter (Vision + Reasoning)",
+    "ArrakisOpenRouterNode": "Arrakis OpenRouter (Vision + Reasoning)",
 }
+
+
+def _run_standalone_self_test() -> int:
+    """
+    Minimal local smoke test.
+    This module is meant to be imported by ComfyUI, but this helps diagnose
+    "no output" reports when someone runs it directly.
+    """
+    node = ArrakisOpenRouterNode()
+    outputs = node.execute_arrakis_openrouter_call(api_key="", user_prompt="standalone-smoke-test")
+
+    print("ComfyUI custom node module loaded successfully.")
+    print("This file does not run a server or workflow by itself.")
+    print("Standalone smoke test status output:")
+    print(outputs[9])
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    raise SystemExit(_run_standalone_self_test())
