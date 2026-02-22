@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,8 +25,15 @@ LOGGER = logging.getLogger(__name__)
 _JSON_DECODER = json.JSONDecoder()
 _SESSION_LOCK = threading.Lock()
 _SESSION_CACHE: Dict[str, requests.Session] = {}
-_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 _RETRY_BASE_DELAY = 0.35
+_MAX_IMAGE_PIXELS = 1_000_000
+_VALID_REASONING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_JSON_SUFFIX = (
+    "\n\n---\nOUTPUT FORMAT: Your response MUST be a single valid JSON object. "
+    "No markdown code fences, no explanation text before or after. "
+    "Start your response with `{` and end with `}`."
+)
 
 
 def _safe_preview(value: Any, limit: int = 1200) -> str:
@@ -46,6 +54,35 @@ def _mask_api_key(api_key: Any) -> str:
     if len(token) <= 10:
         return f"{token[:2]}***"
     return f"{token[:6]}***{token[-4:]}"
+
+
+def _resolve_api_key(api_key: Any) -> Tuple[str, Optional[str], Optional[str]]:
+    raw_value = str(api_key or "").strip()
+    if not raw_value:
+        return "", None, None
+
+    unwrapped = raw_value
+    if (unwrapped.startswith("'") and unwrapped.endswith("'")) or (
+        unwrapped.startswith('"') and unwrapped.endswith('"')
+    ):
+        unwrapped = unwrapped[1:-1].strip()
+
+    env_name: Optional[str] = None
+    if unwrapped.startswith("${") and unwrapped.endswith("}"):
+        env_name = unwrapped[2:-1].strip()
+    elif unwrapped.startswith("$"):
+        env_name = unwrapped[1:].strip()
+
+    if env_name is None:
+        return unwrapped, None, None
+    if not env_name:
+        return "", None, "Nome da variável de ambiente inválido para a API key"
+
+    resolved = str(os.getenv(env_name, "")).strip()
+    if not resolved:
+        return "", env_name, f"Variável de ambiente '{env_name}' não encontrada ou vazia"
+
+    return resolved, env_name, None
 
 
 def _decode_json(candidate: str) -> Optional[Any]:
@@ -115,8 +152,19 @@ class ArrakisOpenRouterNode:
                     },
                 ),
                 "user_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "reasoning_level": (["low", "medium", "high"], {"default": "low"}),
-                "max_tokens": ("INT", {"default": 0, "min": 0, "max": 128000}),
+                "reasoning_level": (
+                    ["none", "low", "minimal", "medium", "high", "xhigh"],
+                    {"default": "low"},
+                ),
+                "max_tokens": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 128000,
+                        "tooltip": "0 = sem limite (deixa o modelo decidir)",
+                    },
+                ),
                 "model": ("STRING", {"multiline": False, "default": "x-ai/grok-4.1-fast"}),
             },
             "optional": {
@@ -124,7 +172,8 @@ class ArrakisOpenRouterNode:
                 "custom_parameters": ("STRING", {"multiline": True, "default": "{}"}),
                 "timeout": ("INT", {"default": 60, "min": 10, "max": 300}),
                 "max_retries": ("INT", {"default": 3, "min": 1, "max": 10}),
-                "debug": ("BOOLEAN", {"default": True}),
+                "enforce_json_output": ("BOOLEAN", {"default": True}),
+                "debug": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -258,12 +307,14 @@ class ArrakisOpenRouterNode:
     def extract_value_strings(self, data: Any, limit: int = 7) -> List[str]:
         values: List[str] = []
 
-        def add_value(value: Any) -> None:
+        def add_value(value: Any, key: Optional[str] = None) -> None:
             if len(values) >= limit:
                 return
 
+            prefix = f"{key}: " if key else ""
+
             if isinstance(value, (str, int, float, bool)) or value is None:
-                values.append(self._stringify_value(value))
+                values.append(f"{prefix}{self._stringify_value(value)}")
                 return
 
             if isinstance(value, list):
@@ -274,13 +325,13 @@ class ArrakisOpenRouterNode:
                 return
 
             if isinstance(value, dict):
-                for sub_key in value:
+                for sub_key, sub_val in value.items():
                     if len(values) >= limit:
                         break
-                    add_value(value[sub_key])
+                    add_value(sub_val, key=str(sub_key))
                 return
 
-            values.append(self._stringify_value(value))
+            values.append(f"{prefix}{self._stringify_value(value)}")
 
         add_value(data)
         return values
@@ -331,11 +382,41 @@ class ArrakisOpenRouterNode:
             scaled = image_np * 255.0 if max_value <= 1.0 else image_np
             image_uint8 = np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
 
-        image_rgb = Image.fromarray(image_uint8, mode="RGB")
+        height, width = image_uint8.shape[:2]
+        total_pixels = height * width
+        if total_pixels > _MAX_IMAGE_PIXELS:
+            scale = (_MAX_IMAGE_PIXELS / float(total_pixels)) ** 0.5
+            new_width = max(1, int(width * scale))
+            new_height = max(1, int(height * scale))
+            temp_image = Image.fromarray(image_uint8, mode="RGB")
+            image_rgb = temp_image.resize((new_width, new_height), Image.LANCZOS)
+            LOGGER.debug(
+                "Image resized from %dx%d to %dx%d (%.1f MP -> 1.0 MP)",
+                width,
+                height,
+                new_width,
+                new_height,
+                total_pixels / 1_000_000.0,
+            )
+        else:
+            image_rgb = Image.fromarray(image_uint8, mode="RGB")
+
         buffer = io.BytesIO()
         image_rgb.save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
+
+    def _sample_frames(self, frames: List[Any], max_frames: int = 3) -> List[Any]:
+        n = len(frames)
+        if n <= max_frames:
+            return frames
+        if max_frames == 1:
+            return [frames[0]]
+        if max_frames == 2:
+            return [frames[0], frames[-1]]
+
+        mid = n // 2
+        return [frames[0], frames[mid], frames[-1]]
 
     def _extract_image_frames(self, user_image: Any) -> List[Any]:
         if user_image is None:
@@ -357,7 +438,8 @@ class ArrakisOpenRouterNode:
             return []
 
         if len(dims) == 4:
-            return [user_image[index] for index in range(dims[0])]
+            all_frames = [user_image[index] for index in range(dims[0])]
+            return self._sample_frames(all_frames, max_frames=3)
         if len(dims) == 3:
             return [user_image]
         return []
@@ -396,7 +478,7 @@ class ArrakisOpenRouterNode:
                 try:
                     parsed = json.loads(stripped)
                     if isinstance(parsed, list):
-                        urls: List[str] = []
+                        urls = []
                         for item in parsed:
                             urls.extend(self._parse_image_inputs(item))
                         return urls
@@ -412,7 +494,7 @@ class ArrakisOpenRouterNode:
 
     def _normalize_reasoning_level(self, reasoning_level: Any) -> str:
         level = str(reasoning_level or "low").strip().lower()
-        if level in {"low", "medium", "high"}:
+        if level in _VALID_REASONING_LEVELS:
             return level
         return "low"
 
@@ -460,6 +542,7 @@ class ArrakisOpenRouterNode:
         user_prompt: Any,
         user_image: Optional[Any] = None,
         extra_messages: Optional[Any] = None,
+        enforce_json_output: bool = True,
     ) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
 
@@ -468,6 +551,12 @@ class ArrakisOpenRouterNode:
             system_prompt_text = system_prompt.strip()
         elif system_prompt is not None:
             system_prompt_text = self._stringify_value(system_prompt).strip()
+
+        if enforce_json_output:
+            if system_prompt_text:
+                system_prompt_text = f"{system_prompt_text}{_JSON_SUFFIX}"
+            else:
+                system_prompt_text = _JSON_SUFFIX.strip()
 
         if system_prompt_text:
             messages.append({"role": "system", "content": system_prompt_text})
@@ -551,6 +640,9 @@ class ArrakisOpenRouterNode:
     def _finalize_outputs(
         self, raw_response: Any, json_response: Any, values: Optional[List[str]], status: Dict[str, Any]
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
+        if isinstance(status, dict) and status.get("status") == "error":
+            LOGGER.warning("ArrakisOpenRouterNode error: %s", status.get("error"))
+
         value_slots = [""] * 7
         if values:
             for index, value in enumerate(values[:7]):
@@ -610,7 +702,7 @@ class ArrakisOpenRouterNode:
             try:
                 parsed = float(retry_after)
                 if parsed > 0:
-                    return min(parsed, 10.0)
+                    return min(parsed, 30.0)
             except ValueError:
                 pass
         return min(_RETRY_BASE_DELAY * attempt, 3.0)
@@ -626,8 +718,9 @@ class ArrakisOpenRouterNode:
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "reasoning": {"effort": reasoning_level},
         }
+        if reasoning_level != "none":
+            payload["reasoning"] = {"effort": reasoning_level}
         if int(max_tokens) > 0:
             payload["max_tokens"] = int(max_tokens)
 
@@ -644,11 +737,15 @@ class ArrakisOpenRouterNode:
 
         if isinstance(custom_reasoning, dict):
             payload["reasoning"] = custom_reasoning
-            if "effort" not in payload["reasoning"]:
+            if "effort" not in payload["reasoning"] and reasoning_level != "none":
                 payload["reasoning"]["effort"] = reasoning_level
             applied.append("reasoning")
         elif isinstance(custom_reasoning_effort, str) and custom_reasoning_effort.strip():
-            payload["reasoning"] = {"effort": custom_reasoning_effort.strip().lower()}
+            normalized_custom_effort = self._normalize_reasoning_level(custom_reasoning_effort)
+            if normalized_custom_effort == "none":
+                payload.pop("reasoning", None)
+            else:
+                payload["reasoning"] = {"effort": normalized_custom_effort}
             applied.append("reasoning_effort")
 
         if custom_max_tokens is not None:
@@ -833,7 +930,8 @@ class ArrakisOpenRouterNode:
         custom_parameters: Any = "{}",
         timeout: int = 60,
         max_retries: int = 3,
-        debug: bool = True,
+        enforce_json_output: bool = True,
+        debug: bool = False,
         **kwargs: Any,
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
         provider_name = "openrouter"
@@ -860,19 +958,27 @@ class ArrakisOpenRouterNode:
                 timeout = kwargs.get("timeout")
             if kwargs.get("max_retries") is not None:
                 max_retries = kwargs.get("max_retries")
+            if kwargs.get("enforce_json_output") is not None:
+                enforce_json_output = bool(kwargs.get("enforce_json_output"))
             if kwargs.get("debug") is not None:
                 debug = bool(kwargs.get("debug"))
+
+            resolved_api_key, api_key_env_name, api_key_error = _resolve_api_key(api_key)
 
             self._debug_log(
                 debug,
                 "execute_start",
                 {
-                    "api_key_masked": _mask_api_key(api_key),
+                    "api_key_masked": _mask_api_key(resolved_api_key),
+                    "api_key_source": (
+                        f"env:{api_key_env_name}" if api_key_env_name else "literal"
+                    ),
                     "model": model,
                     "reasoning_level": reasoning_level,
                     "max_tokens": max_tokens,
                     "timeout": timeout,
                     "max_retries": max_retries,
+                    "enforce_json_output": bool(enforce_json_output),
                     "user_prompt_preview": _safe_preview(user_prompt, 500),
                     "user_image_type": type(user_image).__name__ if user_image is not None else None,
                     "user_image_shape": str(getattr(user_image, "shape", None)),
@@ -880,7 +986,16 @@ class ArrakisOpenRouterNode:
                 },
             )
 
-            if not str(api_key or "").strip():
+            if api_key_error:
+                status = {
+                    "status": "error",
+                    "error": api_key_error,
+                    "provider": provider_name,
+                }
+                self._debug_log(debug, "execute_invalid_api_key_input", status)
+                return self._finalize_outputs("", "", [], status)
+
+            if not resolved_api_key:
                 status = {
                     "status": "error",
                     "error": "API key não fornecida",
@@ -921,7 +1036,13 @@ class ArrakisOpenRouterNode:
             extra_messages = custom_params.pop("messages", None)
 
             try:
-                messages = self.prepare_messages(system_prompt, user_prompt, user_image, extra_messages)
+                messages = self.prepare_messages(
+                    system_prompt,
+                    user_prompt,
+                    user_image,
+                    extra_messages,
+                    enforce_json_output=bool(enforce_json_output),
+                )
             except ValueError as missing_prompt:
                 status = {
                     "status": "error",
@@ -945,7 +1066,9 @@ class ArrakisOpenRouterNode:
                 },
             )
 
-            response_content, status_data = self.make_api_request(api_key, payload, timeout, max_retries, debug=debug)
+            response_content, status_data = self.make_api_request(
+                resolved_api_key, payload, timeout, max_retries, debug=debug
+            )
 
             status_data = status_data or {}
             status_data.setdefault("provider", provider_name)
@@ -953,6 +1076,7 @@ class ArrakisOpenRouterNode:
             status_data["message_count"] = len(messages)
             status_data["reasoning_level"] = normalized_reasoning_level
             status_data["max_tokens"] = int(max_tokens)
+            status_data["enforce_json_output"] = bool(enforce_json_output)
             status_data["image_message_count"] = sum(
                 1
                 for message in messages
