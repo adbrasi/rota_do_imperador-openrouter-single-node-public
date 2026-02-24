@@ -166,6 +166,14 @@ class ArrakisOpenRouterNode:
                     },
                 ),
                 "model": ("STRING", {"multiline": False, "default": "x-ai/grok-4.1-fast"}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 18446744073709551615,
+                    },
+                ),
             },
             "optional": {
                 "user_image": ("IMAGE",),
@@ -193,12 +201,6 @@ class ArrakisOpenRouterNode:
     FUNCTION = "execute_arrakis_openrouter_call"
     CATEGORY = "LLM/API"
     OUTPUT_NODE = True
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # API responses are non-deterministic and can change even with identical inputs.
-        # Returning NaN tells ComfyUI this node should always execute.
-        return float("nan")
 
     def parse_json_from_response(self, text: str) -> Optional[Any]:
         if not text:
@@ -926,6 +928,7 @@ class ArrakisOpenRouterNode:
         reasoning_level: str = "low",
         max_tokens: int = 0,
         model: str = "x-ai/grok-4.1-fast",
+        seed: int = 0,
         user_image: Any = None,
         custom_parameters: Any = "{}",
         timeout: int = 60,
@@ -952,6 +955,8 @@ class ArrakisOpenRouterNode:
                 max_tokens = kwargs.get("max_tokens")
             if kwargs.get("model") is not None:
                 model = kwargs.get("model")
+            if kwargs.get("seed") is not None:
+                seed = kwargs.get("seed")
             if kwargs.get("custom_parameters") is not None:
                 custom_parameters = kwargs.get("custom_parameters")
             if kwargs.get("timeout") is not None:
@@ -974,6 +979,7 @@ class ArrakisOpenRouterNode:
                         f"env:{api_key_env_name}" if api_key_env_name else "literal"
                     ),
                     "model": model,
+                    "seed": seed,
                     "reasoning_level": reasoning_level,
                     "max_tokens": max_tokens,
                     "timeout": timeout,

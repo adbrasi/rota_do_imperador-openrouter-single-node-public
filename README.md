@@ -79,5 +79,5 @@ If `reasoning_level` is `none`, the node omits the `reasoning` field from the pa
 - Images over 1 MP are resized before encoding to reduce payload size and cost.
 - This repository contains a **ComfyUI Python custom node**. It is not a standalone Node.js app.
   Running `python __init__.py` now prints a local smoke-test status to help diagnostics.
-- The node is configured as an **output node** and always re-executes on queue runs (`IS_CHANGED -> NaN`),
-  which avoids silent cache skips for API calls.
+- The node now includes a `seed` input. Keep the same value to reuse cache when inputs are unchanged,
+  or change `seed` to force a fresh API call.
