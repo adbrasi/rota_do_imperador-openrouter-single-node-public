@@ -182,6 +182,18 @@ class ArrakisOpenRouterNode:
                 "max_retries": ("INT", {"default": 3, "min": 1, "max": 10}),
                 "enforce_json_output": ("BOOLEAN", {"default": True}),
                 "debug": ("BOOLEAN", {"default": False}),
+                "value_keys": (
+                    "STRING",
+                    {
+                        "multiline": False,
+                        "default": "",
+                        "tooltip": (
+                            "Chaves JSON separadas por vírgula para mapear em value_1..value_7. "
+                            "Suporta acesso aninhado com ponto (ex: 'name,stats.hp,stats.mp'). "
+                            "Vazio = extração automática na ordem do JSON."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -338,6 +350,31 @@ class ArrakisOpenRouterNode:
         add_value(data)
         return values
 
+    def _resolve_nested_key(self, data: Any, key_path: str) -> Any:
+        parts = key_path.split(".")
+        current = data
+        for part in parts:
+            if isinstance(current, dict):
+                if part in current:
+                    current = current[part]
+                else:
+                    return None
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (ValueError, IndexError):
+                    return None
+            else:
+                return None
+        return current
+
+    def extract_values_by_keys(self, data: Any, keys: List[str]) -> List[str]:
+        values: List[str] = []
+        for key in keys[:7]:
+            resolved = self._resolve_nested_key(data, key.strip())
+            values.append(self._stringify_value(resolved) if resolved is not None else "")
+        return values
+
     def sanitize_custom_parameters(self, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(params, dict):
             return {}
@@ -404,9 +441,9 @@ class ArrakisOpenRouterNode:
             image_rgb = Image.fromarray(image_uint8, mode="RGB")
 
         buffer = io.BytesIO()
-        image_rgb.save(buffer, format="PNG")
+        image_rgb.save(buffer, format="JPEG", quality=85)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
+        return f"data:image/jpeg;base64,{encoded}"
 
     def _sample_frames(self, frames: List[Any], max_frames: int = 3) -> List[Any]:
         n = len(frames)
@@ -785,7 +822,7 @@ class ArrakisOpenRouterNode:
         )
 
         try:
-            request_payload = json.loads(json.dumps(payload))
+            json.dumps(payload)
         except (TypeError, ValueError) as serialization_error:
             return "", {
                 "status": "error",
@@ -806,7 +843,7 @@ class ArrakisOpenRouterNode:
                 response = session.post(
                     url,
                     headers=headers,
-                    json=request_payload,
+                    json=payload,
                     timeout=request_timeout,
                 )
             except requests.exceptions.Timeout:
@@ -935,6 +972,7 @@ class ArrakisOpenRouterNode:
         max_retries: int = 3,
         enforce_json_output: bool = True,
         debug: bool = False,
+        value_keys: str = "",
         **kwargs: Any,
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
         provider_name = "openrouter"
@@ -967,6 +1005,8 @@ class ArrakisOpenRouterNode:
                 enforce_json_output = bool(kwargs.get("enforce_json_output"))
             if kwargs.get("debug") is not None:
                 debug = bool(kwargs.get("debug"))
+            if kwargs.get("value_keys") is not None:
+                value_keys = str(kwargs.get("value_keys"))
 
             resolved_api_key, api_key_env_name, api_key_error = _resolve_api_key(api_key)
 
@@ -1129,7 +1169,15 @@ class ArrakisOpenRouterNode:
                     json_response = json.dumps(parsed_json, indent=2)
                 except (TypeError, ValueError):
                     json_response = str(parsed_json)
-                extracted_values = self.extract_value_strings(parsed_json)
+
+                parsed_value_keys = [
+                    k.strip() for k in str(value_keys).split(",") if k.strip()
+                ] if value_keys and str(value_keys).strip() else []
+
+                if parsed_value_keys:
+                    extracted_values = self.extract_values_by_keys(parsed_json, parsed_value_keys)
+                else:
+                    extracted_values = self.extract_value_strings(parsed_json)
             else:
                 extracted_values = [self._stringify_value(response_content)]
 
